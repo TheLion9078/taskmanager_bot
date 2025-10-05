@@ -73,8 +73,19 @@ def next_repeat_date(task):
 
 # ========== Commands ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Hi! Use /add to add a task.\nExample:\n`/add [Work] Finish report Monday 4pm`",
-                                    parse_mode="Markdown")
+    msg = (
+        "👋 Hi! I'm your Task Manager Bot.\n\n"
+        "Here are the commands you can use:\n\n"
+        "📝 *Task Commands:*\n"
+        "/add [List] Task description day/time repeat=daily priority=high — Add a task\n"
+        "/list — Show all tasks\n"
+        "/summary — Show today's tasks\n"
+        "/done <id> — Mark a task as done\n\n"
+        "⚙️ *Other:*\n"
+        "/start — Show this help message"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
 
 async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Add a new task: /add [List] text [time/day] [repeat=daily/weekly] [priority=high]"""

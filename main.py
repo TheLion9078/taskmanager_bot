@@ -1,294 +1,242 @@
-import json
 import os
-from datetime import datetime
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from telegram import Update, Bot
+import json
+from datetime import datetime, timedelta
+import dateparser
+
+from telegram import Update
 from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
+    ApplicationBuilder, CommandHandler, ContextTypes
 )
+from apscheduler.schedulers.background import BackgroundScheduler
 
-# === CONFIGURATION ===
-BOT_TOKEN = "8476888943:AAGwK6mz9MRHtKqVkO5z0Yelpyxm1bi9_GU"
-CHAT_ID = "6033369627"
-TASK_FILE = "tasks.json"
+# ========== Globals ==========
+TASKS_FILE = "tasks.json"
+tasks = []
+scheduler = BackgroundScheduler(timezone="UTC")
+scheduler.start()
 
-# === UTILITIES ===
+# ========== Helpers ==========
 def load_tasks():
-    if os.path.exists(TASK_FILE):
-        with open(TASK_FILE, "r") as f:
-            return json.load(f)
-    return {"pending": [], "done": []}
-
-def save_tasks(tasks):
-    with open(TASK_FILE, "w") as f:
-        json.dump(tasks, f, indent=4)
-
-# === REMINDERS ===
-async def send_reminder(task):
-    message = f"⏰ Reminder: {task['name']}"
-    if task.get("time"):
-        message += f" — {task['time']}"
-    if task.get("repeat"):
-        message += f" (repeats: {task['repeat']})"
-    await bot_instance.send_message(chat_id=CHAT_ID, text=message)
-
-# === SCHEDULER ===
-scheduler = AsyncIOScheduler(timezone="US/Eastern")
-
-def schedule_task(task):
-    if not task.get("time"):  # no time set, skip scheduling
-        return
-
-    hour, minute = map(int, task["time"].split(":"))
-
-    if task.get("repeat") == "daily":
-        scheduler.add_job(
-            send_reminder, "cron",
-            args=[task], hour=hour, minute=minute,
-            id=task["name"], replace_existing=True
-        )
-    elif task.get("repeat") in [
-        "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"
-    ]:
-        scheduler.add_job(
-            send_reminder, "cron",
-            args=[task], hour=hour, minute=minute,
-            day_of_week=task["repeat"],
-            id=task["name"], replace_existing=True
-        )
+    global tasks
+    if os.path.exists(TASKS_FILE):
+        with open(TASKS_FILE, "r") as f:
+            tasks = json.load(f)
     else:
-        scheduler.add_job(
-            send_reminder, "cron",
-            args=[task], hour=hour, minute=minute,
-            id=task["name"], replace_existing=True
-        )
+        tasks = []
 
-def reschedule_all():
-    scheduler.remove_all_jobs()
-    tasks = load_tasks()
-    now = datetime.now()
-    missed = []
+def save_tasks():
+    with open(TASKS_FILE, "w") as f:
+        json.dump(tasks, f, indent=2, default=str)
 
-    for task in tasks["pending"]:
-        if not task.get("time"):
-            continue
+def fmt_time(dt_str: str | None):
+    """Format ISO datetime string -> 'Mon 06 Oct 16:00'."""
+    if not dt_str:
+        return ""
+    dt = datetime.fromisoformat(dt_str)
+    return dt.strftime("%a %d %b %H:%M")
 
-        try:
-            task_time = datetime.strptime(task["time"], "%H:%M").replace(
-                year=now.year, month=now.month, day=now.day
+def schedule_job_for_task(app, task, chat_id):
+    """Register APScheduler job for this task."""
+    if task.get("scheduled_at"):
+        dt = datetime.fromisoformat(task["scheduled_at"])
+        if dt > datetime.now():
+            scheduler.add_job(
+                send_reminder,
+                "date",
+                run_date=dt,
+                args=[app, chat_id, task],
+                id=f"task-{task['id']}",
+                replace_existing=True
             )
-        except ValueError:
-            continue
 
-        if task_time < now and not task.get("repeat"):
-            missed.append(task)
-        else:
-            schedule_task(task)
+async def send_reminder(app, chat_id, task):
+    """Send reminder when scheduled job fires."""
+    msg = f"⏰ Reminder: {task['text']}"
+    if task.get("list"):
+        msg += f" (📂 {task['list']})"
+    await app.bot.send_message(chat_id=chat_id, text=msg)
 
-    return missed
+def next_repeat_date(task):
+    """Compute next occurrence for recurring tasks."""
+    if not task.get("repeat") or not task.get("scheduled_at"):
+        return None
+    current = datetime.fromisoformat(task["scheduled_at"])
+    repeat = task["repeat"].lower()
 
-# === TELEGRAM COMMANDS ===
+    if repeat == "daily":
+        return current + timedelta(days=1)
+    if repeat == "weekly":
+        return current + timedelta(weeks=1)
+    if repeat == "hourly":
+        return current + timedelta(hours=1)
+    return None
+
+# ========== Commands ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Assalamu Alaikum!\nI’m your Task Reminder Bot.\n\nCommands:\n"
-        "/add <task> [time] [repeat]\n"
-        "/list — show tasks\n"
-        "/done <task name> — mark as done\n"
-        "/history — show completed tasks\n"
-        "/remove <task name> — delete permanently\n"
-        "/clear — remove ALL tasks\n"
-        "/next — show next reminder"
-    )
+    await update.message.reply_text("👋 Hi! Use /add to add a task.\nExample:\n`/add [Work] Finish report Monday 4pm`",
+                                    parse_mode="Markdown")
 
-async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /add <task> [time] [repeat]")
+async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add a new task: /add [List] text [time/day] [repeat=daily/weekly] [priority=high]"""
+    chat_id = update.message.chat_id
+    text = " ".join(context.args)
+    if not text:
+        await update.message.reply_text("Usage:\n`/add [List] Task description day/time repeat=daily priority=high`",
+                                        parse_mode="Markdown")
         return
 
-    name_parts = []
-    time_str, repeat = None, None
+    # Parse [List]
+    list_name = "General"
+    if text.startswith("[") and "]" in text:
+        list_name = text[1:text.index("]")]
+        text = text[text.index("]") + 1:].strip()
 
-    for arg in context.args:
-        if ":" in arg:
-            time_str = arg
-        elif arg.lower() in [
-            "daily", "monday", "tuesday", "wednesday", "thursday",
-            "friday", "saturday", "sunday"
-        ]:
-            repeat = arg.lower()
+    # Extract repeat/priority
+    repeat = None
+    priority = "normal"
+    words = text.split()
+    clean_words = []
+    for w in words:
+        if w.lower().startswith("repeat="):
+            repeat = w.split("=")[1]
+        elif w.lower().startswith("priority="):
+            priority = w.split("=")[1].upper()
         else:
-            name_parts.append(arg)
+            clean_words.append(w)
+    clean_text = " ".join(clean_words)
 
-    name = " ".join(name_parts)
+    # Parse datetime
+    parsed_dt = dateparser.parse(clean_text)
+    scheduled_at = None
+    task_text = clean_text
+    if parsed_dt:
+        scheduled_at = parsed_dt.isoformat()
+        task_text = clean_text
 
-    if not name:
-        await update.message.reply_text("⚠️ Please provide a task name.")
-        return
+    # Build task
+    task = {
+        "id": len(tasks) + 1,
+        "list": list_name,
+        "text": task_text,
+        "scheduled_at": scheduled_at,
+        "repeat": repeat,
+        "priority": priority
+    }
+    tasks.append(task)
+    save_tasks()
 
-    if time_str:
-        try:
-            datetime.strptime(time_str, "%H:%M")
-        except ValueError:
-            await update.message.reply_text("⚠️ Invalid time format. Use HH:MM (24-hour).")
-            return
+    # Schedule reminder
+    schedule_job_for_task(context.application, task, chat_id)
 
-    tasks = load_tasks()
-    task = {"name": name, "time": time_str, "repeat": repeat}
-    tasks["pending"].append(task)
-    save_tasks(tasks)
-    schedule_task(task)
-
-    msg = f"✅ Task added: {name}"
-    if time_str:
-        msg += f" at {time_str}"
+    when = fmt_time(scheduled_at) if scheduled_at else "No time"
+    reply = f"✅ Added task:\n📂 {list_name} — {task_text}\n🕒 {when}"
     if repeat:
-        msg += f" ({repeat})"
-    await update.message.reply_text(msg)
+        reply += f"\n🔁 Repeats: {repeat}"
+    if priority.upper() != "NORMAL":
+        reply += f"\n⚡ Priority: {priority.upper()}"
+    await update.message.reply_text(reply)
 
 async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tasks = load_tasks()
-    msg = "🗓️ *Your Tasks:*\n"
+    """Show all tasks grouped by list."""
+    if not tasks:
+        await update.message.reply_text("📭 No tasks yet.")
+        return
+    out = "📝 *Your Tasks:*\n"
+    grouped = {}
+    for t in tasks:
+        grouped.setdefault(t["list"], []).append(t)
 
-    if tasks["pending"]:
-        msg += "\n🔵 Pending:\n"
-        for i, t in enumerate(tasks["pending"], start=1):
-            line = f"{i}. {t['name']}"
-            if t.get("time"):
-                line += f" — {t['time']}"
+    for lst, lst_tasks in grouped.items():
+        out += f"\n📂 *{lst}*\n"
+        for i, t in enumerate(lst_tasks, 1):
+            when = fmt_time(t.get("scheduled_at"))
+            extra = ""
             if t.get("repeat"):
-                line += f" ({t['repeat']})"
-            msg += line + "\n"
-    else:
-        msg += "\nNo pending tasks.\n"
+                extra += f" 🔁{t['repeat']}"
+            if t.get("priority") and t["priority"].upper() != "NORMAL":
+                extra += f" ⚡{t['priority'].upper()}"
+            out += f"{i}. {t['text']} — {when}{extra}\n"
+    await update.message.reply_text(out, parse_mode="Markdown")
 
-    if tasks["done"]:
-        msg += "\n✅ Completed:\n"
-        for i, t in enumerate(tasks["done"], start=1):
-            msg += f"{i}. {t['name']} (done)\n"
+async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show only today’s tasks grouped by list."""
+    today = datetime.now().date()
+    todays_tasks = [t for t in tasks if t.get("scheduled_at") and datetime.fromisoformat(t["scheduled_at"]).date() == today]
 
-    await update.message.reply_text(msg, parse_mode="Markdown")
-
-async def done_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /done <task name>")
+    if not todays_tasks:
+        await update.message.reply_text("✅ No tasks scheduled for today!")
         return
 
-    name = " ".join(context.args)
-    tasks = load_tasks()
-    found = None
+    out = f"🗓️ *Summary for {today.strftime('%A %d %B')}*\n"
+    grouped = {}
+    for t in todays_tasks:
+        grouped.setdefault(t["list"], []).append(t)
 
-    for t in tasks["pending"]:
-        if t["name"].lower() == name.lower():
+    for lst, lst_tasks in grouped.items():
+        out += f"\n📂 *{lst}*\n"
+        for t in lst_tasks:
+            when = fmt_time(t.get("scheduled_at"))
+            extra = ""
+            if t.get("repeat"):
+                extra += f" 🔁{t['repeat']}"
+            if t.get("priority") and t["priority"].upper() != "NORMAL":
+                extra += f" ⚡{t['priority'].upper()}"
+            out += f"- {t['text']} — {when}{extra}\n"
+
+    await update.message.reply_text(out, parse_mode="Markdown")
+
+async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mark a task as done (by ID in /list order)."""
+    if not context.args:
+        await update.message.reply_text("Usage: /done <task-id>")
+        return
+    try:
+        task_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Invalid task ID.")
+        return
+    found = None
+    for t in tasks:
+        if t["id"] == task_id:
             found = t
             break
-
     if not found:
-        await update.message.reply_text("⚠️ Task not found in pending.")
+        await update.message.reply_text("Task not found.")
         return
 
-    tasks["pending"].remove(found)
-    tasks["done"].append(found)
-    save_tasks(tasks)
+    # Reschedule if repeating
+    if found.get("repeat"):
+        nxt = next_repeat_date(found)
+        if nxt:
+            found["scheduled_at"] = nxt.isoformat()
+            schedule_job_for_task(context.application, found, update.message.chat_id)
+            save_tasks()
+            await update.message.reply_text(f"✅ Task rescheduled for {fmt_time(found['scheduled_at'])}")
+            return
 
-    try:
-        scheduler.remove_job(found["name"])
-    except:
-        pass
+    tasks.remove(found)
+    save_tasks()
+    await update.message.reply_text("✅ Task completed and removed.")
 
-    await update.message.reply_text(f"✅ Marked as done: {found['name']}")
-
-async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tasks = load_tasks()
-    if not tasks["done"]:
-        await update.message.reply_text("No completed tasks yet.")
-        return
-
-    msg = "📜 *Completed Tasks:*\n"
-    for i, t in enumerate(tasks["done"], start=1):
-        msg += f"{i}. {t['name']}\n"
-    await update.message.reply_text(msg, parse_mode="Markdown")
-
-async def remove_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /remove <task name>")
-        return
-
-    name = " ".join(context.args)
-    tasks = load_tasks()
-    filtered_pending = [t for t in tasks["pending"] if t["name"].lower() != name.lower()]
-    filtered_done = [t for t in tasks["done"] if t["name"].lower() != name.lower()]
-
-    if len(filtered_pending) == len(tasks["pending"]) and len(filtered_done) == len(tasks["done"]):
-        await update.message.reply_text("⚠️ Task not found.")
-    else:
-        tasks["pending"] = filtered_pending
-        tasks["done"] = filtered_done
-        save_tasks(tasks)
-        try:
-            scheduler.remove_job(name)
-        except:
-            pass
-        await update.message.reply_text(f"🗑️ Permanently removed: {name}")
-
-async def clear_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_tasks({"pending": [], "done": []})
-    scheduler.remove_all_jobs()
-    await update.message.reply_text("🧹 All tasks cleared!")
-
-async def next_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tasks = load_tasks()
-    now = datetime.now()
-    upcoming = []
-
-    for t in tasks["pending"]:
-        if not t.get("time"):
-            continue
-        try:
-            t_time = datetime.strptime(t["time"], "%H:%M").replace(
-                year=now.year, month=now.month, day=now.day
-            )
-            if t_time > now:
-                upcoming.append((t["name"], t_time, t.get("repeat")))
-        except:
-            continue
-
-    if not upcoming:
-        await update.message.reply_text("No upcoming tasks for today.")
-    else:
-        next_task = min(upcoming, key=lambda x: x[1])
-        repeat_text = f" ({next_task[2]})" if next_task[2] else ""
-        await update.message.reply_text(
-            f"🔜 Next task: {next_task[0]} at {next_task[1].strftime('%H:%M')}{repeat_text}"
-        )
-
-# === MAIN FUNCTION ===
+# ========== Main ==========
 def main():
-    global bot_instance
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    bot_instance = Bot(token=BOT_TOKEN)
+    TOKEN = os.getenv("BOT_TOKEN")
+    if not TOKEN:
+        print("❌ BOT_TOKEN not set")
+        return
 
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    # Handlers
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("add", add_task))
+    app.add_handler(CommandHandler("add", add))
     app.add_handler(CommandHandler("list", list_tasks))
-    app.add_handler(CommandHandler("done", done_task))
-    app.add_handler(CommandHandler("history", history))
-    app.add_handler(CommandHandler("remove", remove_task))
-    app.add_handler(CommandHandler("clear", clear_tasks))
-    app.add_handler(CommandHandler("next", next_task))
+    app.add_handler(CommandHandler("summary", summary))
+    app.add_handler(CommandHandler("done", done))
 
-    missed = reschedule_all()
-    scheduler.start()
+    load_tasks()
 
-    print("✅ Bot is running and reminders are active.")
-
-    if missed:
-        missed_msg = "⚠️ Missed reminders while offline:\n"
-        for m in missed:
-            missed_msg += f"- {m['name']} at {m['time']}\n"
-        app.bot.send_message(chat_id=CHAT_ID, text=missed_msg)
-
+    print("🤖 Bot is running with day+time + /summary support...")
     app.run_polling()
 
 if __name__ == "__main__":
